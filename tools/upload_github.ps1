@@ -87,9 +87,16 @@ if ($LASTEXITCODE -ne 0) { "commit: nothing new to commit" } else { "commit : do
 $clone = "https://github.com/$($user.login)/$RepoName.git"
 $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$token"))
 
-& $Git remote remove origin 2>$null | Out-Null
-& $Git remote add origin $clone
-& $Git -c "http.proxy=$Proxy" -c "http.extraheader=AUTHORIZATION: basic $b64" push -u origin main --quiet
+# Native tools write diagnostics to stderr and PowerShell 5.1 surfaces those as
+# error records; keep this section non-terminating so a missing remote (first
+# run) does not abort the upload.
+$ErrorActionPreference = 'Continue'
+$remotes = @(& $Git remote 2>$null)
+if ($remotes -contains 'origin') { & $Git remote remove origin 2>$null | Out-Null }
+& $Git remote add origin $clone 2>$null | Out-Null
+$ErrorActionPreference = 'Stop'
+
+& $Git -c "http.proxy=$Proxy" -c "http.extraheader=AUTHORIZATION: basic $b64" push -u origin main --quiet 2>$null
 if ($LASTEXITCODE -ne 0) { throw "push failed (exit $LASTEXITCODE)" }
 
 "pushed : $clone"
