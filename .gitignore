@@ -1,0 +1,18 @@
+# 构建产物
+native/*.o
+native/*.exe
+native/*.dll
+tmp/
+native/tmp/
+dist/
+
+# 开发过程截图（README 引用的一张除外）
+native/editor_shot*.png
+!native/editor_shot17.png
+native/fullscreen.png
+native/h.out
+native/h.err
+
+# 测试临时目录
+tools/design/
+*.log

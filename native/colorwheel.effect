@@ -1,0 +1,131 @@
+// obs-colorwheel effect.  Primary grade: lift / gamma / gain / offset +
+// contrast / pivot / saturation / hue / luminance mix.
+//
+// No LUT on purpose.  The whole tone chain is one pow and a few multiply-adds,
+// so per-pixel evaluation costs less than a texture fetch -- and there is no
+// LUT-size / sampling-formula mismatch to get wrong (that class of bug is what
+// cost real time in obs-curves).
+//
+// Alpha convention follows obs-curves/curves.effect, which is proven on this
+// machine: grade src.rgb as delivered and pass src.a through unchanged.
+// Do NOT add OBS_SOURCE_SRGB to the filter -- that would decode to linear
+// before sampling and make every tone control act on linear values.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+
+uniform float4 u_lift;      // xyz additive at the black end, neutral 0
+uniform float4 u_gamma;     // xyz exponent,           neutral 1
+uniform float4 u_gain;      // xyz multiplier,         neutral 1
+uniform float4 u_offset;    // xyz pedestal,           neutral 0
+uniform float4 u_contrast;  // x = contrast (1), y = pivot (0.435)
+uniform float4 u_sat;       // x = saturation gain,    neutral 1
+uniform float4 u_hue;       // x = radians,            neutral 0
+uniform float4 u_lumMix;    // x = 0..1,               neutral 1
+uniform float4 u_extra;     // x = boost, y = shadows, z = highlights (all 0)
+
+sampler_state textureSampler {
+    Filter = Linear;
+    AddressU = Clamp;
+    AddressV = Clamp;
+};
+
+struct VertData {
+    float4 pos : POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VertData VS(VertData v_in)
+{
+    VertData v_out;
+    v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+    v_out.uv = v_in.uv;
+    return v_out;
+}
+
+float luma709(float3 c)
+{
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// pow() is NaN for a negative base, and graded data goes negative easily.
+float spow(float v, float e)
+{
+    return v < 0.0 ? -pow(-v, e) : pow(v, e);
+}
+
+float4 PS(VertData v_in) : TARGET
+{
+    float4 src = image.Sample(textureSampler, v_in.uv);
+    float3 c = src.rgb;
+
+    // 1. offset  2. lift/gain  3. gamma  4. contrast around the pivot
+    c += u_offset.xyz;
+    c = c * (u_gain.xyz - u_lift.xyz) + u_lift.xyz;
+    c = float3(spow(c.r, 1.0 / u_gamma.x),
+               spow(c.g, 1.0 / u_gamma.y),
+               spow(c.b, 1.0 / u_gamma.z));
+    // 4. contrast: normalised logistic around the pivot.  A power curve
+    //    cannot saturate at both ends; Resolve's does.  u_contrast holds
+    //    (k, pivot, s0, 1/(s1-s0)) so this costs one exp per channel.
+    if (u_contrast.x != 0.0) {
+        const float p = u_contrast.y;
+        const float k = u_contrast.x;
+        const float s0 = u_contrast.z;
+        const float inv = u_contrast.w;
+        c = float3((1.0 / (1.0 + exp(-k * (c.r - p))) - s0) * inv,
+                   (1.0 / (1.0 + exp(-k * (c.g - p))) - s0) * inv,
+                   (1.0 / (1.0 + exp(-k * (c.b - p))) - s0) * inv);
+    }
+
+    float y = luma709(c);
+
+    // 5. approximation tier -- neutral 0.0 is a bit-exact identity
+    if (u_extra.y != 0.0) {
+        c += (1.0 - saturate(y)) * u_extra.y * 0.1;
+        y = luma709(c);
+    }
+    if (u_extra.z != 0.0) {
+        c *= 1.0 + saturate(y) * u_extra.z * 0.1;
+        y = luma709(c);
+    }
+
+    // 6. saturation + hue, luma preserving: a neutral pixel has c == y, so it
+    //    can never be tinted, and full desaturation lands on luma.
+    if (u_sat.x != 1.0 || u_hue.x != 0.0 || u_extra.x != 0.0) {
+        float s = u_sat.x;
+        if (u_extra.x != 0.0) {
+            float w = 1.0 - abs(2.0 * saturate(y) - 1.0);
+            s *= 1.0 + u_extra.x * w;
+        }
+        s = max(s, 0.0);
+
+        float cb = (c.b - y) / 1.8556;
+        float cr = (c.r - y) / 1.5748;
+        float ca = cos(u_hue.x);
+        float sa = sin(u_hue.x);
+        float cb2 = cb * ca - cr * sa;
+        float cr2 = cb * sa + cr * ca;
+
+        c.r = y + 1.5748 * cr2;
+        c.g = y - 0.4680823 * cr2 - 0.1873413 * cb2;
+        c.b = y + 1.8556 * cb2;
+        c = y + s * (c - y);
+    }
+
+    // 7. luminance mix: 1 keeps graded luma, 0 restores source luma
+    if (u_lumMix.x != 1.0) {
+        c += (luma709(src.rgb) - luma709(c)) * (1.0 - u_lumMix.x);
+    }
+
+    return float4(saturate(c), src.a);
+}
+
+technique Draw
+{
+    pass
+    {
+        vertex_shader = VS(v_in);
+        pixel_shader  = PS(v_in);
+    }
+}
